@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NetAcad AI Quiz Answerer
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Automatically answers NetAcad quizzes using AI (OpenAI GPT). Auto-selects the correct answer.
 // @author       NetAcad AI Tool
 // @match        https://www.netacad.com/*
@@ -320,20 +320,20 @@
     function getRadioLabel(inp) {
         // Case 1: input is inside a <label>
         const parentLabel = inp.closest('label');
-        if (parentLabel) return parentLabel.innerText.trim();
+        if (parentLabel) return getCleanText(parentLabel);
 
         // Case 2: input has aria-label or aria-labelledby
         if (inp.getAttribute('aria-label')) return inp.getAttribute('aria-label').trim();
         const labelledBy = inp.getAttribute('aria-labelledby');
         if (labelledBy) {
             const el = document.getElementById(labelledBy);
-            if (el) return el.innerText.trim();
+            if (el) return getCleanText(el);
         }
 
         // Case 3: <label for="inputId">
         if (inp.id) {
             const lbl = document.querySelector(`label[for="${inp.id}"]`);
-            if (lbl) return lbl.innerText.trim();
+            if (lbl) return getCleanText(lbl);
         }
 
         // Case 4: next sibling span/div text node
@@ -344,8 +344,24 @@
             sib = sib.nextElementSibling;
         }
 
-        // Case 5: parent element text minus nested input values
+        // Case 5: parent element text
         return inp.parentElement?.innerText?.trim() || '';
+    }
+
+    /**
+     * Return clean innerText of an element,
+     * stripping screenReader spans and aria-hidden nodes (icons, etc.)
+     */
+    function getCleanText(el) {
+        if (!el) return '';
+        // Prefer dedicated text-inner container (NetAcad MCQ)
+        const textInner = el.querySelector('.mcq__item-text-inner, [class*="item-text-inner"]');
+        const source = textInner || el;
+        const clone = source.cloneNode(true);
+        clone.querySelectorAll(
+            '.screenReader-position-text, [class*="screenReader"], [aria-hidden="true"], material-icon, .sr-only'
+        ).forEach(n => n.remove());
+        return clone.innerText?.trim() || '';
     }
 
     /** Find the common ancestor of all radio inputs, then locate the question above them */
@@ -392,7 +408,30 @@
     }
 
     function extractQuestion(ctx = document) {
-        // PRIMARY: radio-input anchored question finding
+        // PRIORITY 0: NetAcad MCQ-specific question selectors
+        const MCQ_Q_SELECTORS = [
+            '[class*="mcq__question"]',
+            '[class*="mcq__stem"]',
+            '[class*="mcq__prompt"]',
+            '[class*="question-stem"]',
+            '[class*="QuestionStem"]',
+            '[class*="questionText"]',
+            '[class*="question-text"]',
+            '[class*="stem"]',
+            '.prompt', '[class*="prompt"]',
+            '[data-testid*="question"]',
+        ];
+        for (const sel of MCQ_Q_SELECTORS) {
+            try {
+                const el = ctx.querySelector(sel);
+                if (el) {
+                    const txt = getCleanText(el);
+                    if (txt.length > 10) return txt;
+                }
+            } catch(e) {}
+        }
+
+        // PRIORITY 1: radio-input anchored question finding
         const radios = Array.from(ctx.querySelectorAll('input[type=radio]'))
             .filter(r => !r.disabled);
         if (radios.length >= 2) {
@@ -400,19 +439,12 @@
             if (q && q.length > 5) return q;
         }
 
-        // FALLBACK: try known class names
-        const QUESTION_SELECTORS = [
-            '[class*="question-stem"]', '[class*="QuestionStem"]',
-            '[class*="questionText"]', '[class*="question-text"]',
-            '[class*="stem"]', '.prompt', '[class*="prompt"]',
-            '[data-testid*="question"]', '[role="heading"]',
-            'h2', 'h3', 'h4',
-        ];
-        for (const sel of QUESTION_SELECTORS) {
+        // PRIORITY 2: headings
+        for (const sel of ['h2', 'h3', 'h4', '[role="heading"]']) {
             try {
                 const el = ctx.querySelector(sel);
                 if (el) {
-                    const txt = el.innerText.trim();
+                    const txt = getCleanText(el);
                     if (txt.length > 10) return txt;
                 }
             } catch(e) {}
@@ -421,7 +453,31 @@
     }
 
     function extractOptions(ctx = document) {
-        // PRIMARY: anchor on radio inputs (always present in quizzes)
+        // PRIORITY 0: NetAcad MCQ native structure
+        // Labels: .mcq__item-label  |  Text: .mcq__item-text-inner
+        // Input is OUTSIDE the label, found via label.htmlFor
+        const mcqLabels = Array.from(
+            ctx.querySelectorAll('.mcq__item-label, [class*="mcq__item-label"]')
+        ).filter(l => !l.closest('[aria-hidden="true"]'));
+
+        if (mcqLabels.length >= 2) {
+            const seen = new Set();
+            const results = [];
+            for (const label of mcqLabels) {
+                const txt = getCleanText(label);
+                if (!txt || txt.length > 350 || seen.has(txt)) continue;
+                if (/não sei|i don.t know|not sure/i.test(txt)) continue;
+                seen.add(txt);
+                // Input is referenced via for="..." attribute
+                const inp = label.htmlFor
+                    ? (ctx.getElementById?.(label.htmlFor) || document.getElementById(label.htmlFor))
+                    : label.querySelector('input');
+                results.push({ el: label, inp: inp || null, txt });
+            }
+            if (results.length >= 2) return results;
+        }
+
+        // PRIORITY 1: anchor on radio inputs
         const radios = Array.from(ctx.querySelectorAll('input[type=radio]'))
             .filter(r => !r.disabled);
 
@@ -430,19 +486,16 @@
             const results = [];
             for (const inp of radios) {
                 const txt = getRadioLabel(inp);
-                // Skip empty, too-long, or duplicate texts
-                // Also skip "I don't know" / "Não sei a resposta" type strings
                 if (!txt || txt.length > 350 || seen.has(txt)) continue;
                 if (/não sei|i don.t know|not sure/i.test(txt)) continue;
                 seen.add(txt);
-                // el = the clickable container (label or parent div)
                 const el = inp.closest('label') || inp.parentElement;
                 results.push({ el, inp, txt });
             }
             if (results.length >= 2) return results;
         }
 
-        // FALLBACK: class-based option selectors
+        // PRIORITY 2: class-based option selectors
         const OPTION_SELECTORS = [
             '[class*="answer-option"]', '[class*="AnswerOption"]',
             '[class*="choice"]',       '[class*="Choice"]',
@@ -453,8 +506,9 @@
                 const els = Array.from(ctx.querySelectorAll(sel));
                 if (els.length >= 2) {
                     const seen = new Set();
-                    return els.map(el => ({ el, inp: el.querySelector('input'), txt: el.innerText.trim() }))
-                              .filter(o => o.txt && !seen.has(o.txt) && seen.add(o.txt));
+                    return els
+                        .map(el => ({ el, inp: el.querySelector('input'), txt: getCleanText(el) }))
+                        .filter(o => o.txt && !seen.has(o.txt) && seen.add(o.txt));
                 }
             } catch(e) {}
         }
