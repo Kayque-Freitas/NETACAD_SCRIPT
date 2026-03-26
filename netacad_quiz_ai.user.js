@@ -368,43 +368,44 @@
     function findQuestionAboveOptions(radios, ctx) {
         if (!radios.length) return null;
 
-        // Build list of all option texts (to exclude them from question search)
-        const optionTexts = radios.map(r => getRadioLabel(r)).filter(Boolean);
-
-        // Walk up from first radio to find a container that holds all radios
+        let bestText = null;
         let ancestor = radios[0].parentElement;
-        for (let depth = 0; depth < 10; depth++) {
+
+        for (let depth = 0; depth < 12; depth++) {
             if (!ancestor || ancestor === ctx.body) break;
-            const current = ancestor; // capture before arrow fn (no-loop-func)
-            const allFound = radios.every(r => current.contains(r));
-            if (allFound) break;
+
+            const allFound = radios.every(r => ancestor.contains(r));
+            if (allFound) {
+                // Clone to safely extract text without mutating the page
+                const clone = ancestor.cloneNode(true);
+                const cloneRadios = Array.from(clone.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'));
+
+                if (cloneRadios.length) {
+                    let limit = cloneRadios[0];
+                    // Walk up to find the direct child of the clone containing our options
+                    while (limit.parentElement && limit.parentElement !== clone) {
+                        limit = limit.parentElement;
+                    }
+                    // Remove the options container and all elements that come after it
+                    let curr = limit;
+                    while (curr) {
+                        let next = curr.nextSibling;
+                        curr.remove();
+                        curr = next;
+                    }
+                }
+
+                const qText = getCleanText(clone);
+                // If we found a meaningful amount of text above the options
+                if (qText.length > 10) {
+                    bestText = qText;
+                    break;
+                }
+            }
             ancestor = ancestor.parentElement;
         }
-        if (!ancestor) return null;
-
-        // Now collect all TEXT-bearing elements inside the ancestor
-        // that are NOT the radio inputs or their labels
-        const candidates = Array.from(ancestor.querySelectorAll(
-            'p, h1, h2, h3, h4, span, div, td, li'
-        )).filter(el => {
-            // Must have direct text children (not just container)
-            const txt = el.innerText?.trim();
-            if (!txt || txt.length < 10) return false;
-            // Must not be one of the option texts
-            if (optionTexts.some(ot => ot && ot.includes(txt))) return false;
-            if (optionTexts.some(ot => ot && txt.includes(ot))) return false;
-            // Must appear BEFORE the first radio in the DOM
-            const pos = ancestor.compareDocumentPosition(el);
-            const firstRadioPos = ancestor.compareDocumentPosition(radios[0]);
-            // el should come before radios[0]
-            return el.compareDocumentPosition(radios[0]) & Node.DOCUMENT_POSITION_FOLLOWING;
-        });
-
-        // Pick longest candidate that appears just before the options
-        if (candidates.length === 0) return null;
-        // Prefer the deepest element closest to the options
-        const last = candidates[candidates.length - 1];
-        return last.innerText.trim();
+        
+        return bestText;
     }
 
     function extractQuestion(ctx = document) {
@@ -432,8 +433,8 @@
         }
 
         // PRIORITY 1: radio-input anchored question finding
-        const radios = Array.from(ctx.querySelectorAll('input[type=radio]'))
-            .filter(r => !r.disabled);
+        const radios = Array.from(ctx.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'))
+            .filter(r => !r.disabled && r.getAttribute('aria-disabled') !== 'true' && !r.closest('#naq-panel'));
         if (radios.length >= 2) {
             const q = findQuestionAboveOptions(radios, ctx);
             if (q && q.length > 5) return q;
@@ -478,8 +479,8 @@
         }
 
         // PRIORITY 1: anchor on radio inputs
-        const radios = Array.from(ctx.querySelectorAll('input[type=radio]'))
-            .filter(r => !r.disabled);
+        const radios = Array.from(ctx.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'))
+            .filter(r => !r.disabled && r.getAttribute('aria-disabled') !== 'true' && !r.closest('#naq-panel'));
 
         if (radios.length >= 2) {
             const seen = new Set();
@@ -517,7 +518,7 @@
 
     /** Debug helper — shows what the script actually sees */
     function debugDOM(ctx = document) {
-        const radios = ctx.querySelectorAll('input[type=radio]');
+        const radios = Array.from(ctx.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')).filter(r => !r.closest('#naq-panel'));
         const q = extractQuestion(ctx);
         const opts = extractOptions(ctx);
         return `Radios: ${radios.length} | Q: ${q ? q.substring(0,40)+'…' : 'não encontrada'} | Opts: ${opts.length}`;
@@ -544,7 +545,7 @@
         const optList = options.map((o, i) => `${i + 1}. ${o.txt}`).join('\n');
         return `Você é um especialista em cibersegurança e redes de computadores (Cisco NetAcad).
 Responda estritamente em JSON com este formato:
-{"correct_index": <número 1-based da opção correta>, "correct_text": "<texto exato da opção correta>", "explanation": "<explicação em português, máximo 2 frases>"}
+{"correct_indices": [<array com os números 1-based das opções corretas>], "correct_text": "<texto exato da(s) opção(ões) correta(s), separadas por vírgula se mais de uma>", "explanation": "<explicação em português, máximo 2 frases>"}
 
 PERGUNTA: ${question}
 
@@ -623,39 +624,47 @@ Responda APENAS com o JSON, sem markdown, sem code fences.`;
         // Extract JSON object
         const match = txt.match(/\{[\s\S]*\}/);
         if (!match) throw new Error('Nenhum JSON encontrado na resposta: ' + raw.substring(0, 200));
-        return JSON.parse(match[0]);
+        let data = JSON.parse(match[0]);
+        if (data.correct_index !== undefined && !data.correct_indices) {
+            data.correct_indices = [data.correct_index];
+        }
+        return data;
     }
 
     // ─────────────────────────────────────────────
     //  CLICK / SELECT HELPERS
     // ─────────────────────────────────────────────
-    function highlightElements(options, correctIndex) {
+    function highlightElements(options, correctIndices) {
         options.forEach((o, i) => {
             o.el.classList.remove('naq-highlight-correct', 'naq-highlight-wrong');
-            if (i + 1 === correctIndex) o.el.classList.add('naq-highlight-correct');
+            if (correctIndices && correctIndices.includes(i + 1)) o.el.classList.add('naq-highlight-correct');
             else o.el.classList.add('naq-highlight-wrong');
         });
     }
 
-    function clickCorrect(options, correctIndex) {
-        const target = options[correctIndex - 1];
-        if (!target) return;
+    function clickCorrect(options, correctIndices) {
+        if (!correctIndices || !Array.isArray(correctIndices)) return;
+        correctIndices.forEach(idx => {
+            const target = options[idx - 1];
+            if (!target) return;
 
-        // Use the stored input reference if available (from radio-anchored extraction)
-        const inp = target.inp
-                 || target.el.querySelector('input[type=radio], input[type=checkbox]')
-                 || null;
+            // Use the stored input reference if available (from radio-anchored extraction)
+            const inp = target.inp
+                     || target.el.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')
+                     || null;
 
-        if (inp) {
-            inp.focus();
-            inp.click();
-            inp.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-            inp.dispatchEvent(new Event('change', { bubbles: true }));
-        } else {
-            target.el.focus();
-            target.el.click();
-            target.el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-        }
+            if (inp) {
+                if (inp.type === 'checkbox' && inp.checked) return;
+                inp.focus();
+                inp.click();
+                inp.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+            } else {
+                target.el.focus();
+                target.el.click();
+                target.el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+        });
     }
 
     // ─────────────────────────────────────────────
@@ -704,20 +713,20 @@ Responda APENAS com o JSON, sem markdown, sem code fences.`;
         try {
             const result = await queryAI(question, options);
 
-            document.getElementById('naq-answer-txt').textContent = result.correct_text || `Opção ${result.correct_index}`;
+            document.getElementById('naq-answer-txt').textContent = result.correct_text || `Opções: ${result.correct_indices.join(', ')}`;
             document.getElementById('naq-explain-txt').textContent = result.explanation || '';
             document.getElementById('naq-answer-section').style.display = 'block';
 
             // Highlight
-            highlightElements(options, result.correct_index);
+            highlightElements(options, result.correct_indices);
 
-            setStatus('done', `✅ Resposta: opção ${result.correct_index}`);
+            setStatus('done', `✅ Resposta: opções ${result.correct_indices.join(', ')}`);
 
             // Auto-click
             if (CFG.autoMode) {
                 setTimeout(() => {
-                    clickCorrect(options, result.correct_index);
-                    setStatus('done', `✅ Selecionado automaticamente • opção ${result.correct_index}`);
+                    clickCorrect(options, result.correct_indices);
+                    setStatus('done', `✅ Selecionado automaticamente • opções ${result.correct_indices.join(', ')}`);
                 }, CFG.delay);
             }
 
@@ -762,6 +771,11 @@ Responda APENAS com o JSON, sem markdown, sem code fences.`;
     //  INIT
     // ─────────────────────────────────────────────
     function init() {
+        if (window.top !== window.self) {
+            try {
+                if (window.parent.document.getElementById('naq-panel')) return;
+            } catch(e) {}
+        }
         // ── DUPLICATE GUARD: only one panel per page ──
         if (document.getElementById('naq-panel')) return;
 
